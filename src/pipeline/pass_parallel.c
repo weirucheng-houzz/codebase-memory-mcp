@@ -2430,6 +2430,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 ws->lsp_overrides++;
             }
         }
+        /* PHP receiver typed in another file: the blocker row sits under the
+         * confidence floor, so `lsp` above is NULL for exactly these calls.
+         * Look it up explicitly and let the class name supply the module prefix
+         * the exact-QN lookup lacks. Mirrored in pass_calls.c. */
+        if (!res.qualified_name || !res.qualified_name[0]) {
+            const CBMResolvedCall *php_blocked =
+                cbm_pipeline_find_php_typed_unindexed(&result->resolved_calls, call, lang);
+            const cbm_gbuf_node_t *php_typed =
+                php_blocked ? cbm_pipeline_php_receiver_typed_target(
+                                  rc->main_gbuf, lang, php_blocked->strategy, php_blocked->callee_qn)
+                            : NULL;
+            if (php_typed) {
+                res.qualified_name = php_typed->qualified_name;
+                res.strategy = CBM_PHP_TYPED_CROSSFILE_STRATEGY;
+                res.confidence = (double)CBM_PHP_TYPED_CROSSFILE_CONF;
+                res.candidate_count = 1;
+                lsp_target = php_typed;
+                ws->lsp_overrides++;
+            }
+        }
         /* #1085: fall back to the registry resolver whenever the LSP did not
          * yield a gbuf-resolvable target — whether no LSP resolution existed,
          * OR the LSP was confident but its callee_qn isn't a node in the gbuf

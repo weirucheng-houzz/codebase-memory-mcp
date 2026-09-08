@@ -1794,6 +1794,83 @@ TEST(lrp_php_s6b_inherited_method_proven) {
     PASS();
 }
 
+/* S6c — receiver typed from ANOTHER file's class, with no import to carry it.
+ *
+ * `$g = new Greeter(); $g->greet();` where Greeter is declared elsewhere and
+ * nothing requires it. php_lsp proves the receiver's class from the `new`, but
+ * the per-file def filter selects the own module plus imported modules only,
+ * so Greeter is absent and resolve_member_call emits the
+ * php_method_typed_unindexed blocker. That marker sits below the LSP
+ * confidence floor, so the bridge discarded it and resolved the call by bare
+ * short name instead — a guess that lands on whichever `greet` the registry
+ * scores highest.
+ *
+ * This is the shape a bare-name autoloader produces — no `use`, no
+ * `require_once`, class name alone — so it is the common case in such a
+ * codebase, not an edge case. Asserting the strategy (not merely that some
+ * CALLS edge exists) is what separates resolution from a lucky short-name
+ * guess, exactly as in S6b. */
+TEST(lrp_php_s6c_constructed_receiver_crossfile) {
+    static const LRP_File constructed[] = {
+        {"Greeter.php",
+         "<?php\nclass Greeter {\n    public function greet() { return 'hi'; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $g = new Greeter();\n"
+                       "        return $g->greet();\n    }\n}\n"}};
+    /* Same starvation, different local proof: a parameter type hint. */
+    static const LRP_File typed_param[] = {
+        {"Greeter.php",
+         "<?php\nclass Greeter {\n    public function greet() { return 'hi'; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run(Greeter $g) { return $g->greet(); }\n}\n"}};
+    const LRP_File *shapes[2] = {constructed, typed_param};
+    const char *names[2] = {"constructed", "typed_param"};
+
+    for (int k = 0; k < 2; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], 2);
+        ASSERT_NOT_NULL(store);
+        int proven = lrp_count_calls_with_strategy(store, lp.project, "php_method_typed_crossfile");
+        if (proven < 1) {
+            fprintf(stderr, "  [LRP] php/S6c/%s FAIL crossfile_calls=%d\n", names[k], proven);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        ASSERT_TRUE(proven >= 1);
+    }
+    PASS();
+}
+
+/* S6c-neg — the recovery must not fire on an ambiguous class name.
+ *
+ * Two `Dup` classes in different directories both declare `ping`. The class
+ * name no longer identifies one declaration, so the blocker must keep its
+ * original job and yield NO crossfile edge rather than pick a winner. This is
+ * the guard that keeps the fix honest in a corpus where class names are not
+ * unique. */
+TEST(lrp_php_s6c_ambiguous_class_stays_blocked) {
+    static const LRP_File f[] = {
+        {"a/Dup.php", "<?php\nclass Dup {\n    public function ping() { return 'a'; }\n}\n"},
+        {"b/Dup.php", "<?php\nclass Dup {\n    public function ping() { return 'b'; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $d = new Dup();\n"
+                       "        return $d->ping();\n    }\n}\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 3);
+    ASSERT_NOT_NULL(store);
+    int crossfile = lrp_count_calls_with_strategy(store, lp.project, "php_method_typed_crossfile");
+    if (crossfile != 0) {
+        fprintf(stderr, "  [LRP] php/S6c/ambiguous FAIL crossfile_calls=%d expected 0\n",
+                crossfile);
+        lrp_diag(store, lp.project, "ambiguous");
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(crossfile == 0);
+    PASS();
+}
+
 /* S7 — PHP interface method call (type-hinted parameter). */
 TEST(lrp_php_s7_interface_call) {
     static const LRP_File f[] = {
@@ -2019,6 +2096,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_php_s5_chained);
     RUN_TEST(lrp_php_s6_inherited_method);
     RUN_TEST(lrp_php_s6b_inherited_method_proven);
+    RUN_TEST(lrp_php_s6c_constructed_receiver_crossfile);
+    RUN_TEST(lrp_php_s6c_ambiguous_class_stays_blocked);
     RUN_TEST(lrp_php_s7_interface_call);
     RUN_TEST(lrp_php_s8_field_type_hint);
 

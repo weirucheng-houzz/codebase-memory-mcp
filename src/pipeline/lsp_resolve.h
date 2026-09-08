@@ -952,4 +952,167 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     return callable_ambiguous ? NULL : unique_callable;
 }
 
+/* Strategy carried by a PHP call whose receiver class was proven locally but
+ * whose declaring file the per-file def filter never selected. */
+#define CBM_PHP_TYPED_UNINDEXED_STRATEGY "php_method_typed_unindexed"
+
+/* Strategy for one recovered here: the class node supplied the module prefix
+ * and the member QN was an exact graph hit. */
+#define CBM_PHP_TYPED_CROSSFILE_STRATEGY "php_method_typed_crossfile"
+
+/* Matches registry.c's CONF_QUALIFIED_SUFFIX. Both bind a locally proven
+ * qualified callee to a unique declaration, so they rank alike. The blocker's
+ * own 0.55 would sit under some downstream weak-strategy floors, and this is
+ * no longer a guess. */
+#define CBM_PHP_TYPED_CROSSFILE_CONF 0.90f
+
+/* Find the PHP typed-unindexed blocker row for one call.
+ *
+ * resolve_member_call emits it at 0.55, deliberately under
+ * CBM_LSP_CONFIDENCE_FLOOR, so every generic matcher above drops it before the
+ * bridge — it was never meant to resolve anything, only to mark that the
+ * receiver's class IS known. Recovering a target from it therefore needs its
+ * own lookup; raising its emitted confidence instead would also admit it to
+ * the reference and usage joins, which read the same floor.
+ *
+ * Match rule mirrors the generic matcher's core: same enclosing caller, same
+ * callee leaf, a site rank that ties the row to this occurrence. Two rows for
+ * one occurrence return NULL. */
+static inline const CBMResolvedCall *cbm_pipeline_find_php_typed_unindexed(
+    const CBMResolvedCallArray *arr, const CBMCall *call, CBMLanguage lang) {
+    if (lang != CBM_LANG_PHP || !arr || arr->count == 0 || !call) {
+        return NULL;
+    }
+    if (!call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    const CBMResolvedCall *found = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy) {
+            continue;
+        }
+        if (strcmp(rc->strategy, CBM_PHP_TYPED_UNINDEXED_STRATEGY) != 0) {
+            continue;
+        }
+        if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+            continue;
+        }
+        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+        if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
+            continue;
+        }
+        if (found && strcmp(found->callee_qn, rc->callee_qn) != 0) {
+            return NULL; /* two typed receivers for one occurrence — stay blocked */
+        }
+        found = rc;
+    }
+    return found;
+}
+
+/* PHP receiver typed in another file.
+ *
+ * php_lsp's resolve_member_call emits strategy php_method_typed_unindexed
+ * when it PROVED the receiver's class from local evidence (`$c = new Child()`,
+ * a typed parameter, an @var docblock) but that class is absent from the
+ * per-file registry — which selects the own module plus imported modules only.
+ * PHP has no import statement for a global-namespace class, so in a
+ * class-per-file codebase the declaring file is never selected and the class
+ * is therefore ALWAYS absent.
+ *
+ * The strategy was meant to BLOCK the unified extractor's short-name fallback,
+ * but its 0.55 confidence put it under the floor, so the row was discarded and
+ * the call fell straight through to cbm_registry_resolve with the BARE callee
+ * name — the very short-name guess the marker existed to prevent. On one PHP
+ * monolith that was 62564 calls resolved by suffix_match/unique_name where the
+ * receiver's class was already known, plus ~8400 that reached no target at all.
+ *
+ * The class name is the part worth keeping, and it supplies the module the QN
+ * lacks: look the class up by name, then take the method by exact QN off each
+ * candidate class node.
+ *
+ * Deliberately class-first rather than the generic Class.method tail scan
+ * allow_tail_match performs. That scan walks every node sharing the METHOD
+ * short name, uncapped, per call site — `__construct` (4596 nodes),
+ * `execute` (3641), `process` (2685) in one PHP monolith — which is the cost
+ * shape #1669 measured. A class-name bucket is ~1, because single-class-per-
+ * file autoloading forces globally unique class names (64313 distinct names
+ * across 64333 declarations in that same corpus, peak bucket 9), so this is
+ * one hash lookup plus a handful of exact hash lookups. It runs only for a
+ * call the bridge was about to drop, so resolution cost for every already-
+ * resolved call is unchanged.
+ *
+ * Two distinct targets return NULL, leaving the blocker its original job
+ * wherever a class name really is ambiguous. Inheritance stays out of scope:
+ * a `describe` declared on Child's BASE has no `Child.describe` node, so the
+ * call stays blocked rather than binding to a same-named method on an
+ * unrelated class. */
+static inline const cbm_gbuf_node_t *cbm_pipeline_php_receiver_typed_target(
+    const cbm_gbuf_t *gbuf, CBMLanguage lang, const char *strategy, const char *callee_qn) {
+    if (lang != CBM_LANG_PHP || !gbuf || !strategy || !callee_qn) {
+        return NULL;
+    }
+    if (strcmp(strategy, CBM_PHP_TYPED_UNINDEXED_STRATEGY) != 0) {
+        return NULL;
+    }
+    /* resolve_member_call builds `<class_qn>.<method>`, and class_qn already
+     * carries a module prefix — but the WRONG one. php_resolve_class_name
+     * qualifies an unresolved short name against the ENCLOSING file's module,
+     * so `new Greeter()` inside Caller.php yields `<proj>.Caller.Greeter.greet`
+     * while the declaration is `<proj>.Greeter.Greeter.greet`. That guessed
+     * prefix is exactly the part to discard: keep the last two segments, which
+     * a PHP class QN always spells as `<ClassShortName>.<method>` (PHP has no
+     * class nested in a class), and re-derive the module from the graph. */
+    const char *tail = cbm_pipeline_qn_class_method_tail(callee_qn);
+    if (!tail) {
+        return NULL;
+    }
+    const char *dot = strchr(tail, '.');
+    if (!dot || dot == tail || !dot[SKIP_ONE]) {
+        return NULL;
+    }
+    size_t class_len = (size_t)(dot - tail);
+    if (class_len >= CBM_SZ_256) {
+        return NULL;
+    }
+    char class_name[CBM_SZ_256];
+    memcpy(class_name, tail, class_len);
+    class_name[class_len] = '\0';
+    const char *method_name = dot + SKIP_ONE;
+
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, class_name, &hits, &hit_count) != 0 || hit_count == 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *cand = hits[i];
+        if (!cand || !cand->label || !cand->qualified_name) {
+            continue;
+        }
+        /* tree-sitter-php traits and interfaces materialize as Class/Interface;
+         * there is no Trait label. */
+        if (strcmp(cand->label, "Class") != 0 && strcmp(cand->label, "Interface") != 0) {
+            continue;
+        }
+        char member_qn[CBM_SZ_512];
+        int written =
+            snprintf(member_qn, sizeof(member_qn), "%s.%s", cand->qualified_name, method_name);
+        if (written <= 0 || (size_t)written >= sizeof(member_qn)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(gbuf, member_qn);
+        if (!member || !cbm_pipeline_node_is_callable_target(member)) {
+            continue;
+        }
+        if (match && match->id != member->id) {
+            return NULL; /* ambiguous class name — keep the blocker */
+        }
+        match = member;
+    }
+    return match;
+}
+
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

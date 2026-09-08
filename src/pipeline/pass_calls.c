@@ -511,6 +511,28 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
+    /* PHP receiver typed in another file: the blocker row sits under the
+     * confidence floor, so `lsp` above is NULL for exactly these calls. Look it
+     * up explicitly and let the class name supply the module prefix the
+     * exact-QN lookup lacks. Placed before the registry fall-through below so a
+     * proven class beats a bare short-name guess. Mirrored in pass_parallel.c. */
+    const CBMResolvedCall *php_blocked =
+        cbm_pipeline_find_php_typed_unindexed(lsp_calls, call, lang);
+    if (php_blocked) {
+        const cbm_gbuf_node_t *php_typed = cbm_pipeline_php_receiver_typed_target(
+            ctx->gbuf, lang, php_blocked->strategy, php_blocked->callee_qn);
+        if (php_typed && source_node->id != php_typed->id) {
+            cbm_resolution_t res = {0};
+            res.qualified_name = php_typed->qualified_name;
+            res.confidence = (double)CBM_PHP_TYPED_CROSSFILE_CONF;
+            res.strategy = CBM_PHP_TYPED_CROSSFILE_STRATEGY;
+            res.candidate_count = 1;
+            emit_classified_edge(ctx, call, source_node, php_typed, &res, module_qn, imp_keys,
+                                 imp_vals, imp_count, false);
+            return SKIP_ONE;
+        }
+    }
+
     /* Synthetic semantic candidates (currently implicit C++ operators) are
      * valid calls only when the language resolver identifies a concrete
      * invocation target. Textual registry/service fallbacks would bind an
