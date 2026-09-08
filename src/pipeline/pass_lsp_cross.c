@@ -181,6 +181,13 @@ static bool pxc_lang_resolves_base_qns(CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    /* PHP reads embedded_types the same way: php_lookup_method walks the
+     * chain by feeding each entry to cbm_registry_lookup_type. Its own
+     * short-name fallback only covers a base declared in the SAME file, so
+     * `class OrderBO extends BaseBO` across two files left `$this->m()`
+     * with no member to find — and every c2-style BO hierarchy is exactly
+     * that shape. */
+    case CBM_LANG_PHP:
         return true;
     default:
         /* Go / JVM / C# / C++ / Rust registrars qualify their own embedded
@@ -199,9 +206,22 @@ static bool pxc_lang_resolves_base_qns(CBMLanguage lang) {
  * a callable target. Import-, module- and suffix-aware strategies are
  * kept; anything unresolved simply retains its source spelling and the
  * behaviour that predates this resolution. */
-static bool pxc_base_strategy_is_weak(const char *strategy) {
+static bool pxc_base_strategy_is_weak(const char *strategy, CBMLanguage lang) {
     if (!strategy || !strategy[0]) {
         return true;
+    }
+    /* PHP keeps unique_name. That strategy fires only when ONE type in the
+     * whole project carries the name, so it is not the "some project type
+     * happens to share this name" binding the drop-list targets — there is no
+     * second candidate to be wrong about. The distinction matters because PHP
+     * has no import statement to bind a global-namespace base: a project whose
+     * loader maps a bare class name to a file (class-per-file, name == base
+     * name) resolves EVERY base this way, so vetoing unique_name vetoed the
+     * entire inheritance view. A namespaced PHP project still binds through
+     * `use` via import_map and never reaches here. suffix_match stays weak for
+     * PHP too — that one does pick among several candidates. */
+    if (lang == CBM_LANG_PHP && strcmp(strategy, "unique_name") == 0) {
+        return false;
     }
     return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
@@ -214,7 +234,7 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * stdlib and third-party bases land here and keep their raw spelling. */
 static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
                                        const char *module_qn, const char **imp_keys,
-                                       const char **imp_vals, int imp_count) {
+                                       const char **imp_vals, int imp_count, CBMLanguage lang) {
     if (!reg || !raw || !raw[0]) {
         return NULL;
     }
@@ -222,7 +242,7 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
-    if (pxc_base_strategy_is_weak(res.strategy)) {
+    if (pxc_base_strategy_is_weak(res.strategy, lang)) {
         return NULL;
     }
     if (!cbm_label_is_type_like(cbm_registry_label_of(reg, res.qualified_name))) {
@@ -236,7 +256,8 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
                                      const cbm_registry_t *reg, const char *module_qn,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const char **imp_keys, const char **imp_vals, int imp_count,
+                                     CBMLanguage lang) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -251,7 +272,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
     }
     for (int i = 0; i < count; i++) {
         const char *qn =
-            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count);
+            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count, lang);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -398,7 +419,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
      * raw source spelling their own registrar already knows how to handle. */
     dst->embedded_types = (reg && pxc_lang_resolves_base_qns(lang))
                               ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
-                                                  imp_keys, imp_vals, imp_count)
+                                                  imp_keys, imp_vals, imp_count, lang)
                               : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = src->signature_param_types;
     dst->signature_param_count = src->signature_param_count;
@@ -1788,6 +1809,130 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
     free(candidate);
 }
 
+/* Mark one module's defs like pxc_mark_entry_defs, but append every index it
+ * newly selects to `work`. Appending only newly-selected indices is what keeps
+ * the closure below linear: an index enters the worklist exactly once, so no
+ * membership test and no rescan of the def array are needed. */
+static int pxc_mark_entry_defs_collect(bool *selected, const pxc_module_entry_t *e,
+                                       const CBMLSPDef *all_defs, CBMLanguage caller_lang,
+                                       int *work, int *tail, int cap) {
+    if (!selected || !e) {
+        return 0;
+    }
+    int added = 0;
+    for (int j = 0; j < e->count; j++) {
+        int idx = e->indices[j];
+        const CBMLSPDef *def = &all_defs[idx];
+        if (!pxc_def_lang_matches(caller_lang, def->lang) || selected[idx]) {
+            continue;
+        }
+        selected[idx] = true;
+        added++;
+        if (work && tail && *tail < cap) {
+            work[(*tail)++] = idx;
+        }
+    }
+    return added;
+}
+
+/* Nearest materialized module prefix of `qn`, trimming trailing segments the
+ * way pxc_mark_import_defs does — a base QN names a CLASS
+ * (`proj.dir.Base.Base`) while the index is keyed by the declaring file module
+ * (`proj.dir.Base`). */
+static pxc_module_entry_t *pxc_module_entry_for_qn(const CBMModuleDefIndex *idx, const char *qn) {
+    if (!idx || !idx->ht || !qn || !qn[0]) {
+        return NULL;
+    }
+    char *candidate = strdup(qn);
+    if (!candidate) {
+        return NULL;
+    }
+    pxc_module_entry_t *found = NULL;
+    for (;;) {
+        found = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
+        if (found) {
+            break;
+        }
+        char *dot = strrchr(candidate, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+    }
+    free(candidate);
+    return found;
+}
+
+/* PHP has no import statement for a global-namespace base class, so the
+ * own-module + import marking above never reaches the file that declares it.
+ * `class Child extends Base` in Child.php therefore built a registry with no
+ * Base.describe in it, and `$this->describe()` had no member to find — it fell
+ * through to a project-wide short-name guess. Every class-per-file PHP
+ * codebase (the shape a bare-name autoloader forces) inherits across files
+ * like this, so the starved case is the common one, not the exception.
+ *
+ * Walk the base-class closure instead: seed a worklist with what is already
+ * selected, then for each class pull in the module declaring each of its
+ * resolved bases, queueing exactly the indices that pull newly selected. A
+ * three-deep hierarchy therefore reaches the grandparent's methods too.
+ *
+ * Every index enters the worklist at most once (it is queued only at the
+ * moment it flips to selected), so the walk is O(defs reached) after the
+ * O(def_count) seeding scan — the same order the caller already pays for its
+ * calloc and its final gather, and never the per-file corpus walk #1669
+ * measured.
+ *
+ * Bases arrive as fully-qualified QNs only when pxc_resolve_base_qn proved
+ * them; an unresolved raw spelling finds no module and is skipped. */
+enum { PXC_PHP_BASE_WORKLIST_MAX = 8192 };
+
+static void pxc_mark_php_base_closure(const CBMModuleDefIndex *idx, bool *selected,
+                                      const CBMLSPDef *all_defs, CBMLanguage caller_lang,
+                                      int *total) {
+    if (!idx || !idx->ht || !selected || !all_defs || !total) {
+        return;
+    }
+    int *work = (int *)malloc((size_t)PXC_PHP_BASE_WORKLIST_MAX * sizeof(*work));
+    if (!work) {
+        return;
+    }
+    int head = 0;
+    int tail = 0;
+    for (int i = 0; i < idx->def_count && tail < PXC_PHP_BASE_WORKLIST_MAX; i++) {
+        if (selected[i]) {
+            work[tail++] = i;
+        }
+    }
+    while (head < tail) {
+        const CBMLSPDef *d = &all_defs[work[head++]];
+        if (!d->embedded_types || !d->embedded_types[0]) {
+            continue;
+        }
+        char *bases = strdup(d->embedded_types);
+        if (!bases) {
+            continue;
+        }
+        char *next = NULL;
+        for (char *tok = bases; tok && *tok; tok = next) {
+            next = strchr(tok, '|');
+            if (next) {
+                *next++ = '\0';
+            }
+            if (!*tok) {
+                continue;
+            }
+            pxc_module_entry_t *e = pxc_module_entry_for_qn(idx, tok);
+            if (e) {
+                *total += pxc_mark_entry_defs_collect(selected, e, all_defs, caller_lang, work,
+                                                      &tail, PXC_PHP_BASE_WORKLIST_MAX);
+            }
+        }
+        free(bases);
+    }
+    free(work);
+}
+
+
 CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_count) {
     if (!all_defs || def_count <= 0) {
         return NULL;
@@ -1865,6 +2010,9 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     pxc_mark_module_defs(idx, selected, all_defs, caller_lang, own_module, &total);
     for (int i = 0; i < imp_count; i++) {
         pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total);
+    }
+    if (caller_lang == CBM_LANG_PHP) {
+        pxc_mark_php_base_closure(idx, selected, all_defs, caller_lang, &total);
     }
     if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
         const char *namespace_key = pxc_namespace_index_key(caller_namespace);

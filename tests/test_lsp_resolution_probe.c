@@ -1734,6 +1734,66 @@ TEST(lrp_php_s6_inherited_method) {
     PASS();
 }
 
+/* S6b — PHP inherited method through a known receiver, asserting the call rode
+ * the inheritance relation rather than guessing.
+ *
+ * The mirror of the Python S6b probe, and RED for the same reason it was: PHP
+ * consumes CBMLSPDef.embedded_types as fully-qualified names, but the cross
+ * pass handed it the raw source spelling ("Base"), which matches nothing when
+ * Base lives in another file. php_lookup_method's own short-name fallback only
+ * covers a same-file base, so `class Child extends Base` across two files left
+ * $this->describe() with no member to find and it fell through to a
+ * project-wide short-name guess at confidence 0.55.
+ *
+ * A guess and a resolved inherited member produce the same edge COUNT, so only
+ * the strategy separates them — every c2-style BO hierarchy is this shape, and
+ * a guess there silently binds the call to an unrelated class that happens to
+ * declare the same method name.
+ *
+ * Scope: this covers a receiver whose class the FILE ITSELF declares ($this,
+ * and by extension self/static). A receiver typed from another file's class
+ * (`$c = new Child(); $c->describe();` in a third file) is still starved — the
+ * per-file filter has no import to follow and no own-class base to close over,
+ * so neither Child nor Base reaches that file's registry. Lifting that needs
+ * the filter to seed from referenced type names, which widens the per-file def
+ * set on exactly the path #1669 measured; it is deliberately not attempted
+ * here. */
+TEST(lrp_php_s6b_inherited_method_proven) {
+    static const LRP_File self_call[] = {
+        {"Base.php", "<?php\nclass Base {\n    public function describe() { return 'base'; }\n}\n"},
+        {"Child.php", "<?php\nclass Child extends Base {\n"
+                      "    public function run() { return $this->describe(); }\n}\n"}};
+    /* Deeper chain: the closure must reach the grandparent, not just the
+     * immediate base, or Mid's file alone lands in the registry. */
+    static const LRP_File three_deep[] = {
+        {"Base.php", "<?php\nclass Base {\n    public function describe() { return 'base'; }\n}\n"},
+        {"Mid.php", "<?php\nclass Mid extends Base {\n}\n"},
+        {"Leaf.php", "<?php\nclass Leaf extends Mid {\n"
+                     "    public function run() { return $this->describe(); }\n}\n"}};
+    const LRP_File *shapes[2] = {self_call, three_deep};
+    const int counts[2] = {2, 3};
+    const char *names[2] = {"self_call", "three_deep"};
+
+    for (int k = 0; k < 2; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], counts[k]);
+        ASSERT_NOT_NULL(store);
+        int inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
+        int proven = lrp_count_calls_with_strategy(store, lp.project, "php_method_");
+        if (inherits < 1 || proven < 1) {
+            fprintf(stderr, "  [LRP] php/S6b/%s FAIL inherits=%d php_method_calls=%d\n", names[k],
+                    inherits, proven);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        /* INHERITS proves the cross-file base was resolved; the php_method_
+         * strategy proves the CALL rode that relation instead of guessing. */
+        ASSERT_TRUE(inherits >= 1);
+        ASSERT_TRUE(proven >= 1);
+    }
+    PASS();
+}
+
 /* S7 — PHP interface method call (type-hinted parameter). */
 TEST(lrp_php_s7_interface_call) {
     static const LRP_File f[] = {
@@ -1958,6 +2018,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_php_s4_static_method);
     RUN_TEST(lrp_php_s5_chained);
     RUN_TEST(lrp_php_s6_inherited_method);
+    RUN_TEST(lrp_php_s6b_inherited_method_proven);
     RUN_TEST(lrp_php_s7_interface_call);
     RUN_TEST(lrp_php_s8_field_type_hint);
 
