@@ -2438,13 +2438,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (!res.qualified_name || !res.qualified_name[0]) {
             const CBMResolvedCall *php_blocked =
                 cbm_pipeline_find_php_typed_unindexed(&result->resolved_calls, call, lang);
+            bool php_via_base = false;
             const cbm_gbuf_node_t *php_typed =
                 php_blocked ? cbm_pipeline_php_receiver_typed_target(
-                                  rc->main_gbuf, lang, php_blocked->strategy, php_blocked->callee_qn)
+                                  rc->main_gbuf, lang, php_blocked->strategy,
+                                  php_blocked->callee_qn, &php_via_base)
                             : NULL;
             if (php_typed) {
                 res.qualified_name = php_typed->qualified_name;
-                res.strategy = CBM_PHP_TYPED_CROSSFILE_STRATEGY;
+                res.strategy = php_via_base ? CBM_PHP_TYPED_INHERITED_STRATEGY
+                                            : CBM_PHP_TYPED_CROSSFILE_STRATEGY;
                 res.confidence = (double)CBM_PHP_TYPED_CROSSFILE_CONF;
                 res.candidate_count = 1;
                 lsp_target = php_typed;

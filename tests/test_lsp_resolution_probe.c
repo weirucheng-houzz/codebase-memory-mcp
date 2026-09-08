@@ -1849,6 +1849,51 @@ TEST(lrp_php_s6c_constructed_receiver_crossfile) {
  * original job and yield NO crossfile edge rather than pick a winner. This is
  * the guard that keeps the fix honest in a corpus where class names are not
  * unique. */
+/* S6f — receiver typed in another file, method declared on its BASE.
+ *
+ * `$c = new Child(); $c->describe();` where describe() lives on Base. The
+ * receiver's class is proven, but `Child.describe` names no node, so the
+ * direct crossfile lookup misses and the call is withheld rather than guessed.
+ * Walking the class node's own base_classes property reaches Base.describe.
+ *
+ * Two shapes, because a BO hierarchy is rarely one level: c2's chain runs
+ * C2VendorListing -> MPBO -> C2BO, so the walk has to be transitive to be
+ * worth anything. */
+TEST(lrp_php_s6f_constructed_receiver_inherited_method) {
+    static const LRP_File one_level[] = {
+        {"Base.php", "<?php\nclass Base {\n    public function describe() { return 'b'; }\n}\n"},
+        {"Child.php", "<?php\nclass Child extends Base {\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $c = new Child();\n"
+                       "        return $c->describe();\n    }\n}\n"}};
+    static const LRP_File three_deep[] = {
+        {"Base.php", "<?php\nclass Base {\n    public function describe() { return 'b'; }\n}\n"},
+        {"Mid.php", "<?php\nclass Mid extends Base {\n}\n"},
+        {"Leaf.php", "<?php\nclass Leaf extends Mid {\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $c = new Leaf();\n"
+                       "        return $c->describe();\n    }\n}\n"}};
+    const LRP_File *shapes[2] = {one_level, three_deep};
+    const int counts[2] = {3, 4};
+    const char *names[2] = {"one_level", "three_deep"};
+
+    for (int k = 0; k < 2; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], counts[k]);
+        ASSERT_NOT_NULL(store);
+        int proven = lrp_exact_calls_by_name(store, lp.project, "run", "describe");
+        if (proven < 1) {
+            fprintf(stderr, "  [LRP] php/S6f/%s FAIL calls_to_base=%d\n", names[k], proven);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        ASSERT_TRUE(proven >= 1);
+    }
+    PASS();
+}
+
 TEST(lrp_php_s6c_ambiguous_class_stays_blocked) {
     static const LRP_File f[] = {
         {"a/Dup.php", "<?php\nclass Dup {\n    public function ping() { return 'a'; }\n}\n"},
@@ -2162,6 +2207,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_php_s6b_inherited_method_proven);
     RUN_TEST(lrp_php_s6c_constructed_receiver_crossfile);
     RUN_TEST(lrp_php_s6c_ambiguous_class_stays_blocked);
+    RUN_TEST(lrp_php_s6f_constructed_receiver_inherited_method);
     RUN_TEST(lrp_php_s6d_unindexed_base_method_stays_unresolved);
     RUN_TEST(lrp_php_s6e_builtin_calls_stay_unresolved);
     RUN_TEST(lrp_php_s7_interface_call);

@@ -1011,6 +1011,102 @@ static inline const CBMResolvedCall *cbm_pipeline_find_php_typed_unindexed(
     return found;
 }
 
+/* Strategy for one reached through the receiver class's own base chain. */
+#define CBM_PHP_TYPED_INHERITED_STRATEGY "php_method_inherited_crossfile"
+
+enum {
+    /* A PHP hierarchy this deep is already pathological; c2's hottest chain
+     * (C2VendorListing -> MPBO -> C2BO) is three. */
+    CBM_PHP_BASE_DEPTH_MAX = 8,
+    /* Classes held per BFS level, and total classes visited across the walk.
+     * Both bound the work regardless of how wide `implements` lists get. */
+    CBM_PHP_BASE_FRONTIER_MAX = 32,
+    CBM_PHP_BASE_VISITED_MAX = 64,
+};
+
+/* `<class_qn>.<method>` if that names a callable node, else NULL. */
+static inline const cbm_gbuf_node_t *cbm_php_member_on_class(const cbm_gbuf_t *gbuf,
+                                                             const cbm_gbuf_node_t *cls,
+                                                             const char *method_name) {
+    if (!cls || !cls->qualified_name) {
+        return NULL;
+    }
+    char member_qn[CBM_SZ_512];
+    int written = snprintf(member_qn, sizeof(member_qn), "%s.%s", cls->qualified_name, method_name);
+    if (written <= 0 || (size_t)written >= sizeof(member_qn)) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(gbuf, member_qn);
+    return (member && cbm_pipeline_node_is_callable_target(member)) ? member : NULL;
+}
+
+/* Class-like node for graph purposes. tree-sitter-php materializes traits and
+ * interfaces as Class/Interface; there is no Trait label. */
+static inline bool cbm_php_node_is_class_like(const cbm_gbuf_node_t *n) {
+    return n && n->label && n->qualified_name &&
+           (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0);
+}
+
+/* Copy the base-class spellings out of a node's properties JSON.
+ *
+ * pass_parallel/pass_definitions write them as `"base_classes":["MPBO",...]`
+ * when the def node is minted — BEFORE call resolution runs. That ordering is
+ * the whole reason this reads the property instead of INHERITS edges:
+ * resolve_file_semantic draws INHERITS *after* resolve_file_calls in the same
+ * per-file loop, so at this point a given class's INHERITS edge may or may not
+ * exist depending on which worker reached its file first. Reading the property
+ * is deterministic; walking the edges would not be.
+ *
+ * Only the last `\` or `.` segment is kept: the value is a SOURCE spelling, so
+ * a namespaced `Foo\Bar` must be looked up by the node name `Bar`. Returns the
+ * number of names written. */
+static inline int cbm_php_base_classes_of(const char *props_json, char out[][CBM_SZ_256], int max) {
+    if (!props_json || max <= 0) {
+        return 0;
+    }
+    const char *key = strstr(props_json, "\"base_classes\":[");
+    if (!key) {
+        return 0;
+    }
+    const char *p = key + strlen("\"base_classes\":[");
+    int n = 0;
+    while (*p && *p != ']' && n < max) {
+        if (*p != '"') {
+            p++;
+            continue;
+        }
+        p++; /* opening quote */
+        char raw[CBM_SZ_256];
+        size_t w = 0;
+        while (*p && *p != '"' && w + SKIP_ONE < sizeof(raw)) {
+            if (*p == '\\' && p[1]) {
+                p++; /* JSON escape: keep the escaped byte itself */
+            }
+            raw[w++] = *p++;
+        }
+        raw[w] = '\0';
+        if (*p == '"') {
+            p++; /* closing quote */
+        }
+        if (!raw[0]) {
+            continue;
+        }
+        /* Source spelling -> node name: keep the final segment. */
+        const char *leaf = raw;
+        for (const char *q = raw; *q; q++) {
+            if (*q == '\\' || *q == '.') {
+                leaf = q + SKIP_ONE;
+            }
+        }
+        if (!leaf[0]) {
+            continue;
+        }
+        snprintf(out[n], CBM_SZ_256, "%s", leaf);
+        n++;
+    }
+    return n;
+}
+
 /* PHP receiver typed in another file.
  *
  * php_lsp's resolve_member_call emits strategy php_method_typed_unindexed
@@ -1043,13 +1139,22 @@ static inline const CBMResolvedCall *cbm_pipeline_find_php_typed_unindexed(
  * call the bridge was about to drop, so resolution cost for every already-
  * resolved call is unchanged.
  *
- * Two distinct targets return NULL, leaving the blocker its original job
- * wherever a class name really is ambiguous. Inheritance stays out of scope:
- * a `describe` declared on Child's BASE has no `Child.describe` node, so the
- * call stays blocked rather than binding to a same-named method on an
- * unrelated class. */
+ * When the class itself declares no such method the walk climbs its own
+ * base_classes, one level at a time, so `$c = new Leaf(); $c->describe();`
+ * reaches a `describe` on Leaf's grandparent. Resolving a whole level before
+ * descending preserves PHP's override order: the nearest declaration wins.
+ * `via_base` reports whether the hit came from an ancestor, so the caller can
+ * label the edge.
+ *
+ * Two declarations at the SAME distance return NULL, as does an ambiguous
+ * class name — the marker keeps its original job wherever the graph cannot
+ * name one target. */
 static inline const cbm_gbuf_node_t *cbm_pipeline_php_receiver_typed_target(
-    const cbm_gbuf_t *gbuf, CBMLanguage lang, const char *strategy, const char *callee_qn) {
+    const cbm_gbuf_t *gbuf, CBMLanguage lang, const char *strategy, const char *callee_qn,
+    bool *via_base) {
+    if (via_base) {
+        *via_base = false;
+    }
     if (lang != CBM_LANG_PHP || !gbuf || !strategy || !callee_qn) {
         return NULL;
     }
@@ -1086,33 +1191,110 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_php_receiver_typed_target(
     if (cbm_gbuf_find_by_name(gbuf, class_name, &hits, &hit_count) != 0 || hit_count == 0) {
         return NULL;
     }
-    const cbm_gbuf_node_t *match = NULL;
-    for (int i = 0; i < hit_count; i++) {
-        const cbm_gbuf_node_t *cand = hits[i];
-        if (!cand || !cand->label || !cand->qualified_name) {
-            continue;
+
+    /* The class's OWN declaration is scanned across every same-named node, with
+     * no cap: this decides both the direct hit and the ambiguity verdict, and a
+     * truncated scan could call an ambiguous name unique. The frontier cap
+     * below applies only to climbing, where the budget is a cost bound rather
+     * than a correctness one. (A PHP corpus really can have hundreds of nodes
+     * under one name — XML fixtures parsed as classes give `mysqldump` 346.) */
+    {
+        const cbm_gbuf_node_t *direct = NULL;
+        for (int i = 0; i < hit_count; i++) {
+            if (!cbm_php_node_is_class_like(hits[i])) {
+                continue;
+            }
+            const cbm_gbuf_node_t *member = cbm_php_member_on_class(gbuf, hits[i], method_name);
+            if (!member) {
+                continue;
+            }
+            if (direct && direct->id != member->id) {
+                return NULL; /* ambiguous class name — keep the marker */
+            }
+            direct = member;
         }
-        /* tree-sitter-php traits and interfaces materialize as Class/Interface;
-         * there is no Trait label. */
-        if (strcmp(cand->label, "Class") != 0 && strcmp(cand->label, "Interface") != 0) {
-            continue;
+        if (direct) {
+            return direct; /* via_base stays false */
         }
-        char member_qn[CBM_SZ_512];
-        int written =
-            snprintf(member_qn, sizeof(member_qn), "%s.%s", cand->qualified_name, method_name);
-        if (written <= 0 || (size_t)written >= sizeof(member_qn)) {
-            continue;
-        }
-        const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(gbuf, member_qn);
-        if (!member || !cbm_pipeline_node_is_callable_target(member)) {
-            continue;
-        }
-        if (match && match->id != member->id) {
-            return NULL; /* ambiguous class name — keep the blocker */
-        }
-        match = member;
     }
-    return match;
+
+    /* Nothing on the class itself: climb its bases. */
+    const cbm_gbuf_node_t *frontier[CBM_PHP_BASE_FRONTIER_MAX];
+    int frontier_n = 0;
+    const cbm_gbuf_node_t *visited[CBM_PHP_BASE_VISITED_MAX];
+    int visited_n = 0;
+    for (int i = 0; i < hit_count && frontier_n < CBM_PHP_BASE_FRONTIER_MAX; i++) {
+        if (cbm_php_node_is_class_like(hits[i])) {
+            frontier[frontier_n++] = hits[i];
+            if (visited_n < CBM_PHP_BASE_VISITED_MAX) {
+                visited[visited_n++] = hits[i];
+            }
+        }
+    }
+
+    for (int depth = 0; depth <= CBM_PHP_BASE_DEPTH_MAX && frontier_n > 0; depth++) {
+        /* Resolve against the WHOLE current level before descending, so a
+         * method declared nearer the class always beats a same-named one
+         * further up — that is PHP's own override order. Depth 0 is skipped:
+         * the unbounded scan above already settled it. */
+        const cbm_gbuf_node_t *match = NULL;
+        for (int i = 0; depth > 0 && i < frontier_n; i++) {
+            const cbm_gbuf_node_t *member =
+                cbm_php_member_on_class(gbuf, frontier[i], method_name);
+            if (!member) {
+                continue;
+            }
+            if (match && match->id != member->id) {
+                return NULL; /* two declarations at the same distance — decline */
+            }
+            match = member;
+        }
+        if (match) {
+            /* depth 0 was settled above, so any hit here came from an ancestor. */
+            if (via_base) {
+                *via_base = true;
+            }
+            return match;
+        }
+
+        /* Descend: every base of every class on this level. */
+        const cbm_gbuf_node_t *next[CBM_PHP_BASE_FRONTIER_MAX];
+        int next_n = 0;
+        for (int i = 0; i < frontier_n && next_n < CBM_PHP_BASE_FRONTIER_MAX; i++) {
+            char bases[CBM_PHP_BASE_FRONTIER_MAX][CBM_SZ_256];
+            int base_n = cbm_php_base_classes_of(frontier[i]->properties_json, bases,
+                                                 CBM_PHP_BASE_FRONTIER_MAX);
+            for (int b = 0; b < base_n && next_n < CBM_PHP_BASE_FRONTIER_MAX; b++) {
+                const cbm_gbuf_node_t **bhits = NULL;
+                int bhit_count = 0;
+                if (cbm_gbuf_find_by_name(gbuf, bases[b], &bhits, &bhit_count) != 0) {
+                    continue;
+                }
+                for (int h = 0; h < bhit_count && next_n < CBM_PHP_BASE_FRONTIER_MAX; h++) {
+                    if (!cbm_php_node_is_class_like(bhits[h])) {
+                        continue;
+                    }
+                    bool seen = false;
+                    for (int v = 0; v < visited_n; v++) {
+                        if (visited[v]->id == bhits[h]->id) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (seen || visited_n >= CBM_PHP_BASE_VISITED_MAX) {
+                        continue; /* cycle, diamond, or budget spent */
+                    }
+                    visited[visited_n++] = bhits[h];
+                    next[next_n++] = bhits[h];
+                }
+            }
+        }
+        frontier_n = next_n;
+        for (int i = 0; i < next_n; i++) {
+            frontier[i] = next[i];
+        }
+    }
+    return NULL;
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

@@ -520,13 +520,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const CBMResolvedCall *php_blocked =
         cbm_pipeline_find_php_typed_unindexed(lsp_calls, call, lang);
     if (php_blocked) {
+        bool php_via_base = false;
         const cbm_gbuf_node_t *php_typed = cbm_pipeline_php_receiver_typed_target(
-            ctx->gbuf, lang, php_blocked->strategy, php_blocked->callee_qn);
+            ctx->gbuf, lang, php_blocked->strategy, php_blocked->callee_qn, &php_via_base);
         if (php_typed && source_node->id != php_typed->id) {
             cbm_resolution_t res = {0};
             res.qualified_name = php_typed->qualified_name;
             res.confidence = (double)CBM_PHP_TYPED_CROSSFILE_CONF;
-            res.strategy = CBM_PHP_TYPED_CROSSFILE_STRATEGY;
+            res.strategy = php_via_base ? CBM_PHP_TYPED_INHERITED_STRATEGY
+                                        : CBM_PHP_TYPED_CROSSFILE_STRATEGY;
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, php_typed, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
