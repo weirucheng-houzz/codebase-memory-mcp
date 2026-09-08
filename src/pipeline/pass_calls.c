@@ -1151,6 +1151,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * up explicitly and let the class name supply the module prefix the
      * exact-QN lookup lacks. Placed before the registry fall-through below so a
      * proven class beats a bare short-name guess. Mirrored in pass_parallel.c. */
+    bool php_receiver_absent = false;
     const CBMResolvedCall *php_blocked =
         cbm_pipeline_find_php_typed_unindexed(lsp_calls, call, lang);
     if (php_blocked) {
@@ -1166,6 +1167,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                  imp_vals, imp_count, false, route_mount, lang);
             return SKIP_ONE;
         }
+        /* Nothing found, and that is the marker doing the job it was written
+         * for: the receiver's class IS known and the method is declared nowhere
+         * on it. The usual cause is a base class outside the indexed tree —
+         * `$this->assertEquals(...)` in a class extending PHPUnit's TestCase,
+         * with vendor/ excluded. Guessing by bare name then binds every such
+         * call to whichever project class happens to declare an `assertEquals`;
+         * on one monolith that was 6207 edges onto a single unrelated test
+         * batch class. Withhold the registry fall-through instead. Service and
+         * route classification below still runs, so only the plain CALLS guess
+         * is given up. Mirrored in pass_parallel.c. */
+        php_receiver_absent = !php_typed;
     }
 
     /* Synthetic semantic candidates (currently implicit C++ operators) are
@@ -1263,7 +1275,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     cbm_resolution_t res = {0};
     if (swift_candidates >= 0) {
         res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
-                                        rust_external, php_vendor_call, java_external,
+                                        rust_external, php_vendor_call || php_receiver_absent,
+                                        java_external,
                                         cbm_pipeline_caller_is_test(source_node, rel, lang));
     }
     /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
@@ -1324,6 +1337,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * to Perl — other languages are unaffected. */
     if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method, call->callee_name,
                                         res.strategy)) {
+        return 0;
+    }
+
+    /* PHP builtin noise guard. Same shape as the Perl guard above, and placed
+     * beside it so the two stay comparable. Mirrored in pass_parallel.c. */
+    if (cbm_php_suppress_builtin_match(lang == CBM_LANG_PHP, call->callee_name, res.strategy)) {
         return 0;
     }
 
