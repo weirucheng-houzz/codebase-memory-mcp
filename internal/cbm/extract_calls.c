@@ -1924,6 +1924,37 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
                     return qual;
                 }
             }
+            /* A static call names its class at the call site: keep it. PHP's
+             * grammar puts the class in a `scope` field, but the field-based
+             * resolution below only reads `object` (the member-call field), so
+             * `Foo::bar()` used to yield the bare `bar` — throwing away the one
+             * piece of evidence the call site carries. Resolution then fell to
+             * a project-wide name guess, which in a namespace-free codebase
+             * binds `Foo::bar` to whichever unrelated class also declares
+             * `bar`. `Foo::bar` reaches qualified_suffix_match instead, which
+             * matches the `.Foo.bar` tail exactly or declines.
+             *
+             * Only a literal class name qualifies. `self`/`static`/`parent` are
+             * relative_scope nodes with dedicated LSP strategies, and `$x::` is
+             * a variable_name whose class is not known here; both keep the bare
+             * name. A namespaced scope is reduced to its last segment because
+             * candidate QNs are path-derived, not namespace-derived. */
+            const char *scope_kind = ts_node_type(scope);
+            if (sc && mn &&
+                (strcmp(scope_kind, "name") == 0 || strcmp(scope_kind, "qualified_name") == 0)) {
+                const char *cls = strrchr(sc, '\\');
+                cls = cls ? cls + 1 : sc;
+                char *qualified = cls[0] ? cbm_arena_sprintf(a, "%s::%s", cls, mn) : NULL;
+                /* The route table keys on a "::<verb>" suffix, and the Route
+                 * gate above already claimed the genuine router calls. Any
+                 * other scope reaching here with a verb-shaped method name
+                 * (Cache::get) would suffix-match that table and mint a junk
+                 * Route from a slash-prefixed cache key (#952). Those keep the
+                 * bare name, which the table deliberately never matches. */
+                if (qualified && cbm_service_pattern_route_method(qualified) == NULL) {
+                    return qualified;
+                }
+            }
         }
     }
 

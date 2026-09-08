@@ -724,6 +724,63 @@ TEST(php_function) {
     PASS();
 }
 
+/* A static call names its class at the call site, and the callee must keep it
+ * so the registry can match the `.Cls.method` tail instead of guessing among
+ * every class that declares `notify`. */
+TEST(php_static_call_keeps_class_scope) {
+    CBMFileResult *r = extract("<?php\nclass Caller { public function run() { "
+                               "OrderEmailUtils::notify($x); } }",
+                               CBM_LANG_PHP, "t", "Caller.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT(count_calls_named(r, "OrderEmailUtils::notify") == 1);
+    ASSERT(count_calls_named(r, "notify") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A namespaced scope reduces to its last segment: candidate QNs are built from
+ * file paths, so the namespace prefix would never match a tail. */
+TEST(php_static_call_scope_drops_namespace) {
+    CBMFileResult *r = extract("<?php\nclass Caller { public function run() { "
+                               "\\App\\Mail\\Sender::send($x); } }",
+                               CBM_LANG_PHP, "t", "Caller.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT(count_calls_named(r, "Sender::send") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* self/static/parent carry no class name of their own and have dedicated LSP
+ * strategies; a `$var::` scope is not known here. All keep the bare callee. */
+TEST(php_relative_and_dynamic_scope_stay_bare) {
+    CBMFileResult *r =
+        extract("<?php\nclass Child extends Base { public function run() { self::alpha(); "
+                "parent::beta(); static::gamma(); $cls::delta(); } }",
+                CBM_LANG_PHP, "t", "Child.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT(count_calls_named(r, "alpha") == 1);
+    ASSERT(count_calls_named(r, "beta") == 1);
+    ASSERT(count_calls_named(r, "gamma") == 1);
+    ASSERT(count_calls_named(r, "delta") == 1);
+    ASSERT(count_calls_named(r, "self::alpha") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #952: the route table keys on a "::<verb>" suffix, so qualifying a
+ * verb-shaped method on a non-router scope would mint a junk Route from a
+ * slash-prefixed cache key. Those calls keep the bare name. */
+TEST(php_static_call_route_verb_stays_bare) {
+    CBMFileResult *r = extract("<?php\nclass Caller { public function run() { "
+                               "Cache::get('/leading/slash/key'); } }",
+                               CBM_LANG_PHP, "t", "Caller.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT(count_calls_named(r, "Cache::get") == 0);
+    ASSERT(count_calls_named(r, "get") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Ruby --- */
 TEST(ruby_class) {
     CBMFileResult *r = extract("class Animal\n  def initialize(name)\n    @name = name\n  end\n  "
@@ -7206,6 +7263,10 @@ SUITE(extraction) {
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);
+    RUN_TEST(php_static_call_keeps_class_scope);
+    RUN_TEST(php_static_call_scope_drops_namespace);
+    RUN_TEST(php_relative_and_dynamic_scope_stay_bare);
+    RUN_TEST(php_static_call_route_verb_stays_bare);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);

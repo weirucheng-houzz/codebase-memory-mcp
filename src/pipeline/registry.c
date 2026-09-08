@@ -941,6 +941,21 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * Language agnostic by design: the registry holds no language, and every
  * language that writes receiver chains gains the same protection. */
 static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+    /* `Scope::name` is a class-scope call, not a receiver value chain, and the
+     * guard below reads it as one. A static call is legal on any class in the
+     * hierarchy, so `Child::helper()` resolves to `Base.helper` whose parent
+     * segment is `Base` — absent from the chain, and the guard would drop a
+     * correct edge rather than admit it. Inheritance is invisible to the
+     * registry, so trusting the scope is the only option available here.
+     *
+     * Only the exactly-two-segment `::` form is exempt. A longer chain
+     * (`Foo::bar()->baz`) carries receiver shape the guard can still judge,
+     * and a `.` anywhere means the callee is a value chain, not a bare
+     * class-scope call. */
+    const char *scope_sep = strstr(callee_name, "::");
+    if (scope_sep && !strstr(scope_sep + 2, "::") && !strchr(callee_name, '.')) {
+        return true;
+    }
     /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
      * the same way qualified_suffix_match does. */
     char dotted[CBM_SZ_512];

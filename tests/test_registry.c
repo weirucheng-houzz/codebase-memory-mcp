@@ -326,6 +326,46 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     PASS();
 }
 
+/* A static call is legal on any class in the hierarchy, so `Child::helper()`
+ * legitimately resolves to `Base.helper` — whose parent segment is absent from
+ * the callee chain. The receiver-chain guard must not read a two-segment
+ * class-scope callee as a value chain and drop the edge. */
+TEST(resolve_class_scope_admits_inherited_method) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "helper", "proj.platform.BaseUtils.BaseUtils.helper", "Method");
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "ChildUtils::helper", "proj.web.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.platform.BaseUtils.BaseUtils.helper");
+
+    /* A dotted receiver chain keeps the guard: an unrelated class must not
+     * absorb a value-chain call just because the leaf name matches. */
+    cbm_resolution_t chain =
+        cbm_registry_resolve(r, "Session.config.helper", "proj.web.Caller", NULL, NULL, 0);
+    ASSERT_TRUE(!chain.qualified_name);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The scope still disambiguates when the class does declare the method: the
+ * exact tail wins over an unrelated same-named method elsewhere. */
+TEST(resolve_class_scope_prefers_declaring_class) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "notify", "proj.platform.OrderEmailUtils.OrderEmailUtils.notify",
+                     "Method");
+    cbm_registry_add(r, "notify", "proj.platform.VendorEmailUtils.VendorEmailUtils.notify",
+                     "Method");
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "OrderEmailUtils::notify", "proj.web.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.platform.OrderEmailUtils.OrderEmailUtils.notify");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -1027,6 +1067,8 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(resolve_class_scope_admits_inherited_method);
+    RUN_TEST(resolve_class_scope_prefers_declaring_class);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
