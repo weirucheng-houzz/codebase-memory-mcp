@@ -385,6 +385,117 @@ static const char *const PERL_BUILTINS[] = {
     "unlink",    "unshift", "values",  "wantarray", "warn",     "write",
 };
 
+/* ── PHP builtin guard ─────────────────────────────────────────────
+ * PHP keeps ONE flat global function namespace and forbids redeclaring a
+ * builtin, so a bare `count($x)` / `implode(...)` / `trim(...)` in PHP source
+ * is ALWAYS the builtin — it can never be a project function. The wrong edges
+ * this kills point at project METHODS that merely share the name
+ * (`RedisCluster::count`, `EditCouponRequest::implode`), and a bare function
+ * call cannot reach a method at all.
+ *
+ * Language constructs are in here too. `empty`, `isset`, `unset`, `list`,
+ * `eval`, `exit`, `die`, `echo`, `print`, `array`, `include`, `require` are
+ * not functions in the first place, and `empty($x)` was the single largest
+ * source of false edges in one 28k-file monolith: 16693 call sites across the
+ * tree all wired to one unrelated `PagedList::empty`, which made an ordinary
+ * helper the graph's highest in-degree node and corrupted every importance
+ * and blast-radius answer that read it.
+ *
+ * MUST stay sorted ASCII-ascending for bsearch. */
+static const char *const PHP_BUILTINS[] = {
+    "abs", "addslashes", "array", "array_chunk", "array_column", "array_combine",
+    "array_diff", "array_diff_key", "array_fill", "array_fill_keys", "array_filter", "array_flip",
+    "array_intersect", "array_intersect_key", "array_is_list", "array_key_exists", "array_keys", "array_map",
+    "array_merge", "array_merge_recursive", "array_multisort", "array_pad", "array_pop", "array_product",
+    "array_push", "array_rand", "array_reduce", "array_reverse", "array_search", "array_shift",
+    "array_slice", "array_splice", "array_sum", "array_unique", "array_unshift", "array_values",
+    "array_walk", "arsort", "asort", "base64_decode", "base64_encode", "base_convert",
+    "basename", "bindec", "boolval", "call_user_func", "call_user_func_array", "ceil",
+    "checkdate", "chmod", "class_exists", "compact", "constant", "copy",
+    "count", "crc32", "current", "date", "date_default_timezone_set", "decbin",
+    "dechex", "decoct", "define", "defined", "deg2rad", "die",
+    "dirname", "doubleval", "each", "echo", "empty", "end",
+    "error_log", "error_reporting", "eval", "exit", "exp", "explode",
+    "extract", "fclose", "feof", "fflush", "fgets", "file",
+    "file_exists", "file_get_contents", "file_put_contents", "filesize", "floatval", "flock",
+    "floor", "fmod", "fopen", "fread", "fseek", "ftell",
+    "func_get_args", "func_num_args", "function_exists", "fwrite", "get_class", "get_class_methods",
+    "get_object_vars", "get_parent_class", "getenv", "gettype", "glob", "gmdate",
+    "gmmktime", "hash", "header", "hexdec", "html_entity_decode", "htmlentities",
+    "htmlspecialchars", "htmlspecialchars_decode", "http_build_query", "implode", "in_array", "include",
+    "include_once", "ini_get", "ini_set", "intdiv", "interface_exists", "intval",
+    "is_a", "is_array", "is_bool", "is_callable", "is_dir", "is_file",
+    "is_float", "is_int", "is_integer", "is_null", "is_numeric", "is_object",
+    "is_readable", "is_scalar", "is_string", "is_subclass_of", "is_writable", "isset",
+    "iterator_to_array", "join", "json_decode", "json_encode", "key", "krsort",
+    "ksort", "lcfirst", "levenshtein", "list", "log", "log10",
+    "ltrim", "max", "mb_convert_encoding", "mb_strlen", "mb_strpos", "mb_strtolower",
+    "mb_strtoupper", "mb_substr", "md5", "memory_get_usage", "metaphone", "method_exists",
+    "microtime", "min", "mkdir", "mktime", "mt_rand", "natcasesort",
+    "natsort", "next", "nl2br", "number_format", "number_parse", "octdec",
+    "parse_str", "parse_url", "pathinfo", "php_uname", "phpversion", "pi",
+    "pow", "preg_grep", "preg_last_error", "preg_match", "preg_match_all", "preg_quote",
+    "preg_replace", "preg_replace_callback", "preg_split", "prev", "print", "print_r",
+    "printf", "property_exists", "putenv", "rad2deg", "rand", "random_int",
+    "range", "rawurldecode", "rawurlencode", "realpath", "rename", "require",
+    "require_once", "reset", "rewind", "rmdir", "round", "rsort",
+    "rtrim", "scandir", "serialize", "session_destroy", "session_start", "set_error_handler",
+    "setcookie", "settype", "sha1", "shuffle", "similar_text", "sizeof",
+    "sleep", "sort", "soundex", "spl_autoload_register", "spl_object_hash", "sprintf",
+    "sqrt", "str_contains", "str_ends_with", "str_ireplace", "str_pad", "str_repeat",
+    "str_replace", "str_split", "str_starts_with", "strip_tags", "stripos", "stripslashes",
+    "strlen", "strpos", "strrchr", "strrpos", "strstr", "strtolower",
+    "strtotime", "strtoupper", "strval", "substr", "sys_get_temp_dir", "tempnam",
+    "time", "touch", "trigger_error", "trim", "uasort", "ucfirst",
+    "ucwords", "uksort", "uniqid", "unlink", "unserialize", "unset",
+    "urldecode", "urlencode", "usleep", "usort", "var_dump", "var_export",
+    "vprintf", "vsprintf", "wordwrap",
+};
+
+static int php_builtin_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+/* True if `name` is one of the curated PHP builtins or language constructs.
+ * PHP-scoped: callers gate on the file language. */
+bool cbm_php_is_builtin(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, PHP_BUILTINS, sizeof(PHP_BUILTINS) / sizeof(PHP_BUILTINS[0]),
+                   sizeof(PHP_BUILTINS[0]), php_builtin_cmp) != NULL;
+}
+
+/* Suppress a resolved PHP call whose callee names a builtin and which only
+ * landed by a WEAK short-name strategy. Mirrors the Perl guard's contract, with
+ * one deliberate difference: it does NOT key on is_method. PHP member calls are
+ * exactly what the receiver-typing strategies resolve accurately, and dropping
+ * them here would undo that.
+ *
+ * A qualified callee (`Foo::count`, `$obj->count`) is left alone: that really
+ * can be a project method implementing Countable, and it is not the bare
+ * builtin invocation this guard targets.
+ *
+ * same_module / import_map are kept for the namespaced-function case PHP does
+ * allow (`namespace Foo; function count() {}`), where a local declaration
+ * legitimately shadows the builtin. */
+bool cbm_php_suppress_builtin_match(bool is_php, const char *callee_name, const char *strategy) {
+    if (!is_php || !callee_name || !callee_name[0]) {
+        return false;
+    }
+    if (strchr(callee_name, '.') || strstr(callee_name, "::") || strstr(callee_name, "->")) {
+        return false; /* qualified receiver — not a bare builtin call */
+    }
+    if (!cbm_php_is_builtin(callee_name)) {
+        return false;
+    }
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "fuzzy") == 0;
+}
+
 static int perl_builtin_cmp(const void *key, const void *elem) {
     return strcmp((const char *)key, *(const char *const *)elem);
 }

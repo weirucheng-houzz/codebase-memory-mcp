@@ -48,6 +48,12 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".ccls-cache", ".clangd", "elm-stuff", "_opam", ".cpcache", ".shadow-cljs",
     /* Deploy */
     ".vercel", ".netlify", "deploy", "deployed",
+    /* Static-analysis stubs. `.phan/internal_stubs/` declares the PHP builtins
+     * (json_encode, curl_init, ...) as bodyless functions purely so Phan can
+     * type-check against them. Indexed as project code they become the only
+     * definitions those names have, and every builtin call in the tree wires
+     * to them: 6426 CALLS edges into one stub file on a 28k-file monolith. */
+    ".phan",
     /* Misc */
     ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
 

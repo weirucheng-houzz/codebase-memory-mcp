@@ -1871,6 +1871,70 @@ TEST(lrp_php_s6c_ambiguous_class_stays_blocked) {
     PASS();
 }
 
+/* S6d — receiver's class is known, method is declared NOWHERE on it.
+ *
+ * `class MyTest extends TestCase { ... $this->assertEquals(...) }` where
+ * TestCase is not in the indexed tree (PHPUnit lives in vendor/, which the
+ * discovery skip-list excludes). php_lsp proves the receiver's class, finds no
+ * `assertEquals` on it or any indexed ancestor, and emits the
+ * php_method_typed_unindexed marker — which is CORRECT: there is no target to
+ * find, and the honest answer is no edge.
+ *
+ * A decoy class supplies the trap. Guessing by bare name binds the call to
+ * whichever project class happens to declare an `assertEquals`; on one
+ * monolith that produced 6207 edges onto a single unrelated test batch class,
+ * making it one of the graph's top in-degree nodes. Assert no CALLS edge
+ * reaches the decoy. */
+TEST(lrp_php_s6d_unindexed_base_method_stays_unresolved) {
+    static const LRP_File f[] = {
+        {"Decoy.php", "<?php\nclass Decoy {\n"
+                      "    public function assertEquals($a, $b) { return $a === $b; }\n}\n"},
+        {"MyTest.php", "<?php\nclass MyTest extends TestCase {\n"
+                       "    public function testThing() {\n"
+                       "        return $this->assertEquals(1, 1);\n    }\n}\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int onto_decoy = lrp_exact_calls_by_name(store, lp.project, "testThing", "assertEquals");
+    if (onto_decoy != 0) {
+        fprintf(stderr, "  [LRP] php/S6d FAIL calls_onto_decoy=%d expected 0\n", onto_decoy);
+        lrp_diag(store, lp.project, "s6d");
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(onto_decoy == 0);
+    PASS();
+}
+
+/* S6e — a bare PHP builtin call never reaches a project method sharing its
+ * name. PHP forbids redeclaring a builtin, so `count($arr)` is always the
+ * builtin; an edge to `Collection::count` is always wrong. `empty($x)` is not
+ * even a function. Both were top false-edge sources on a real monolith
+ * (16693 onto one `PagedList::empty`). */
+TEST(lrp_php_s6e_builtin_calls_stay_unresolved) {
+    static const LRP_File f[] = {
+        {"Collection.php", "<?php\nclass Collection {\n"
+                           "    public function count() { return 0; }\n"
+                           "    public function empty() { return true; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run($arr) {\n"
+                       "        if (empty($arr)) { return 0; }\n"
+                       "        return count($arr);\n    }\n}\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int onto_count = lrp_exact_calls_by_name(store, lp.project, "run", "count");
+    int onto_empty = lrp_exact_calls_by_name(store, lp.project, "run", "empty");
+    if (onto_count != 0 || onto_empty != 0) {
+        fprintf(stderr, "  [LRP] php/S6e FAIL count=%d empty=%d expected 0 0\n", onto_count,
+                onto_empty);
+        lrp_diag(store, lp.project, "s6e");
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(onto_count == 0);
+    ASSERT_TRUE(onto_empty == 0);
+    PASS();
+}
+
 /* S7 — PHP interface method call (type-hinted parameter). */
 TEST(lrp_php_s7_interface_call) {
     static const LRP_File f[] = {
@@ -2098,6 +2162,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_php_s6b_inherited_method_proven);
     RUN_TEST(lrp_php_s6c_constructed_receiver_crossfile);
     RUN_TEST(lrp_php_s6c_ambiguous_class_stays_blocked);
+    RUN_TEST(lrp_php_s6d_unindexed_base_method_stays_unresolved);
+    RUN_TEST(lrp_php_s6e_builtin_calls_stay_unresolved);
     RUN_TEST(lrp_php_s7_interface_call);
     RUN_TEST(lrp_php_s8_field_type_hint);
 

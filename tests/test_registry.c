@@ -823,6 +823,65 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+/* ── PHP builtin guard ──────────────────────────────────────────── */
+
+TEST(php_builtin_set_recognizes_builtins_and_constructs) {
+    /* Representative entries from across the sorted set. */
+    ASSERT_TRUE(cbm_php_is_builtin("count"));
+    ASSERT_TRUE(cbm_php_is_builtin("implode"));
+    ASSERT_TRUE(cbm_php_is_builtin("json_encode"));
+    ASSERT_TRUE(cbm_php_is_builtin("trim"));
+    ASSERT_TRUE(cbm_php_is_builtin("abs")); /* first element */
+    /* Language constructs, not functions at all — the largest noise source. */
+    ASSERT_TRUE(cbm_php_is_builtin("empty"));
+    ASSERT_TRUE(cbm_php_is_builtin("isset"));
+    ASSERT_TRUE(cbm_php_is_builtin("unset"));
+    ASSERT_TRUE(cbm_php_is_builtin("list"));
+    PASS();
+}
+
+TEST(php_builtin_set_rejects_project_names) {
+    ASSERT_FALSE(cbm_php_is_builtin("executeSelect"));
+    ASSERT_FALSE(cbm_php_is_builtin("getUserId"));
+    ASSERT_FALSE(cbm_php_is_builtin("Count")); /* case-sensitive */
+    ASSERT_FALSE(cbm_php_is_builtin(""));
+    ASSERT_FALSE(cbm_php_is_builtin(NULL));
+    PASS();
+}
+
+TEST(php_suppress_drops_weak_builtin_matches) {
+    /* A bare builtin call cannot reach a project method that shares the name:
+     * PHP forbids redeclaring a builtin. */
+    ASSERT_TRUE(cbm_php_suppress_builtin_match(true, "empty", "suffix_match"));
+    ASSERT_TRUE(cbm_php_suppress_builtin_match(true, "count", "unique_name"));
+    ASSERT_TRUE(cbm_php_suppress_builtin_match(true, "implode", "suffix_match"));
+    ASSERT_TRUE(cbm_php_suppress_builtin_match(true, "trim", "fuzzy"));
+    PASS();
+}
+
+TEST(php_suppress_keeps_qualified_and_genuine_calls) {
+    /* A QUALIFIED callee really can be a project method implementing Countable
+     * — `$c->count()` on a collection — and is not the bare builtin call this
+     * guard targets. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "$c->count", "suffix_match"));
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "ArrayCollection::count", "suffix_match"));
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "coll.count", "unique_name"));
+    /* A local/namespaced declaration legitimately shadows the builtin. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "count", "same_module"));
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "trim", "import_map"));
+    /* Receiver-typed strategies are never touched — that is the accurate path. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "count", "php_method_typed"));
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "count", "php_method_typed_crossfile"));
+    /* A genuine project function is never suppressed. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "executeSelect", "suffix_match"));
+    /* Non-PHP languages are unaffected. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(false, "count", "suffix_match"));
+    /* No match → nothing to suppress. */
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "count", NULL));
+    ASSERT_FALSE(cbm_php_suppress_builtin_match(true, "count", ""));
+    PASS();
+}
+
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
      * strategy that collapses them; unique_name is #1572 and must stay. */
@@ -1106,6 +1165,10 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(php_builtin_set_recognizes_builtins_and_constructs);
+    RUN_TEST(php_builtin_set_rejects_project_names);
+    RUN_TEST(php_suppress_drops_weak_builtin_matches);
+    RUN_TEST(php_suppress_keeps_qualified_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);

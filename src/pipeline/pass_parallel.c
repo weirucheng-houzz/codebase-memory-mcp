@@ -2434,6 +2434,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * confidence floor, so `lsp` above is NULL for exactly these calls.
          * Look it up explicitly and let the class name supply the module prefix
          * the exact-QN lookup lacks. Mirrored in pass_calls.c. */
+        bool php_receiver_absent = false;
         if (!res.qualified_name || !res.qualified_name[0]) {
             const CBMResolvedCall *php_blocked =
                 cbm_pipeline_find_php_typed_unindexed(&result->resolved_calls, call, lang);
@@ -2449,6 +2450,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 lsp_target = php_typed;
                 ws->lsp_overrides++;
             }
+            /* Marker fired and found nothing: the receiver's class IS known and
+             * the method is declared nowhere on it, the usual cause being a base
+             * class outside the indexed tree (`$this->assertEquals()` with
+             * vendor/ excluded). Withhold the bare-name registry guess. Service
+             * and route classification below still runs. Mirrored in
+             * pass_calls.c. */
+            php_receiver_absent = php_blocked && !php_typed;
         }
         /* #1085: fall back to the registry resolver whenever the LSP did not
          * yield a gbuf-resolvable target — whether no LSP resolution existed,
@@ -2464,7 +2472,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * semantic candidates are deliberately excluded: they require an
          * exact LSP target and must fail closed rather than accepting a textual
          * registry match. */
-        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
+        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
+            !php_receiver_absent) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
@@ -2493,6 +2502,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * Gated to Perl — other languages are unaffected. */
         if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
                                             call->callee_name, res.strategy)) {
+            continue;
+        }
+
+        /* PHP builtin noise guard. Same shape as the Perl guard above, and
+         * placed beside it so the two stay comparable. Mirrored in
+         * pass_calls.c. */
+        if (cbm_php_suppress_builtin_match(lang == CBM_LANG_PHP, call->callee_name, res.strategy)) {
             continue;
         }
 

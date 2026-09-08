@@ -269,6 +269,18 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
+/* True if `name` is one of the curated PHP builtins or language constructs
+ * (count/implode/empty/isset/...). PHP-scoped: callers gate on the file
+ * language. */
+bool cbm_php_is_builtin(const char *name);
+
+/* Decide whether a resolved PHP call edge is builtin noise to drop: true only
+ * for PHP, only for an UNQUALIFIED builtin-named callee, and only when the
+ * match used a weak short-name strategy. PHP forbids redeclaring a builtin, so
+ * a bare `count($x)` is always the builtin and can never reach the project
+ * method that shares its name. Pure; unit-tested in test_registry.c. */
+bool cbm_php_suppress_builtin_match(bool is_php, const char *callee_name, const char *strategy);
+
 /* Decide whether a resolved member-call edge is weak-strategy noise to drop
  * (#592/#606/#1276): true only when the CALLER's per-language gate says the
  * guard applies (`enabled`), only for a member call with an unresolved receiver
