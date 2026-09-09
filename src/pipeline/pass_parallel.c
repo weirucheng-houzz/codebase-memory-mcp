@@ -2430,20 +2430,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 ws->lsp_overrides++;
             }
         }
-        /* PHP receiver typed in another file: the blocker row sits under the
-         * confidence floor, so `lsp` above is NULL for exactly these calls.
-         * Look it up explicitly and let the class name supply the module prefix
-         * the exact-QN lookup lacks. Mirrored in pass_calls.c. */
+        /* PHP receiver whose class php_lsp proved: let the class name supply
+         * the module prefix the exact-QN lookup lacks. Two kinds of claim land
+         * here. The below-floor blocker row is invisible to the matcher above,
+         * so `lsp` is NULL for those. An above-floor php_method_typed row does
+         * reach the matcher but can carry a callee_qn that names no node —
+         * a PHP runtime stub such as `Throwable.getMessage`. Both mean the
+         * receiver's class is known, so both get the same treatment.
+         * Mirrored in pass_calls.c. */
         bool php_receiver_absent = false;
         if (!res.qualified_name || !res.qualified_name[0]) {
-            const CBMResolvedCall *php_blocked =
-                cbm_pipeline_find_php_typed_unindexed(&result->resolved_calls, call, lang);
+            CBMPhpTypedClaim php_claim =
+                cbm_pipeline_php_typed_claim(&result->resolved_calls, call, lang, lsp);
             bool php_via_base = false;
             const cbm_gbuf_node_t *php_typed =
-                php_blocked ? cbm_pipeline_php_receiver_typed_target(
-                                  rc->main_gbuf, lang, php_blocked->strategy,
-                                  php_blocked->callee_qn, &php_via_base)
-                            : NULL;
+                php_claim.callee_qn
+                    ? cbm_pipeline_php_receiver_typed_target(rc->main_gbuf, lang,
+                                                             php_claim.strategy,
+                                                             php_claim.callee_qn, &php_via_base)
+                    : NULL;
             if (php_typed) {
                 res.qualified_name = php_typed->qualified_name;
                 res.strategy = php_via_base ? CBM_PHP_TYPED_INHERITED_STRATEGY
@@ -2453,13 +2458,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 lsp_target = php_typed;
                 ws->lsp_overrides++;
             }
-            /* Marker fired and found nothing: the receiver's class IS known and
-             * the method is declared nowhere on it, the usual cause being a base
+            /* A claim that found nothing: the receiver's class IS known and the
+             * method is declared nowhere on it in this graph — either a base
              * class outside the indexed tree (`$this->assertEquals()` with
-             * vendor/ excluded). Withhold the bare-name registry guess. Service
-             * and route classification below still runs. Mirrored in
-             * pass_calls.c. */
-            php_receiver_absent = php_blocked && !php_typed;
+             * vendor/ excluded) or a PHP runtime class the graph deliberately
+             * does not hold (`$e->getMessage()`). Withhold the bare-name
+             * registry guess. Service and route classification below still
+             * runs. Mirrored in pass_calls.c. */
+            php_receiver_absent = php_claim.callee_qn && !php_typed;
         }
         /* #1085: fall back to the registry resolver whenever the LSP did not
          * yield a gbuf-resolvable target — whether no LSP resolution existed,

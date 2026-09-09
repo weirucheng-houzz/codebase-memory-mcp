@@ -1950,6 +1950,168 @@ TEST(lrp_php_s6d_unindexed_base_method_stays_unresolved) {
     PASS();
 }
 
+/* S6g — a property assigned `new T()` inside the class carries T's type, so
+ * `$this->prop->method()` reaches T's method rather than a same-named decoy.
+ *
+ * PHP before 7.4 had no property type declarations and a large legacy monolith
+ * shows the result: 216121 untyped property declarations against 1031 typed
+ * ones. The declaration therefore says nothing, but the assignment does, and
+ * the `new T()` form states the type outright.
+ *
+ * Only assignments that AGREE are usable. `lazy_init` covers the common
+ * `if (!$this->x) { $this->x = new T(); }` shape, which puts the assignment in
+ * an ordinary method rather than the constructor — on that monolith only 1559
+ * of 8057 such assignments sit in a constructor, so constructor-only inference
+ * would leave most of them starved. `conflicting` pins the other side: two
+ * different types assigned to one property leave it untyped, because picking
+ * either would be a guess -- the property must come out of the scan with no
+ * type at all rather than with the last one seen. */
+TEST(lrp_php_s6g_property_assigned_new_types_the_chain) {
+    static const LRP_File in_ctor[] = {
+        {"Dao.php", "<?php\nclass Dao {\n"
+                    "    public function fetchRows($sql) { return array(); }\n}\n"},
+        {"Decoy.php", "<?php\nclass Decoy {\n"
+                      "    public function fetchRows($sql) { return null; }\n}\n"},
+        {"Repo.php", "<?php\nclass Repo {\n"
+                     "    protected $dao;\n"
+                     "    public function __construct() {\n"
+                     "        $this->dao = new Dao();\n    }\n"
+                     "    public function run() {\n"
+                     "        return $this->dao->fetchRows('select 1');\n    }\n}\n"}};
+    static const LRP_File lazy_init[] = {
+        {"Dao.php", "<?php\nclass Dao {\n"
+                    "    public function fetchRows($sql) { return array(); }\n}\n"},
+        {"Decoy.php", "<?php\nclass Decoy {\n"
+                      "    public function fetchRows($sql) { return null; }\n}\n"},
+        {"Repo.php", "<?php\nclass Repo {\n"
+                     "    protected $dao;\n"
+                     "    protected function dao() {\n"
+                     "        if (!$this->dao) { $this->dao = new Dao(); }\n"
+                     "        return $this->dao;\n    }\n"
+                     "    public function run() {\n"
+                     "        return $this->dao->fetchRows('select 1');\n    }\n}\n"}};
+    const LRP_File *shapes[2] = {in_ctor, lazy_init};
+    const char *names[2] = {"in_ctor", "lazy_init"};
+
+    /* `fetchRows` is declared on both classes, so match on the QN tail to say
+     * which one the edge landed on. */
+    for (int k = 0; k < 2; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], 3);
+        ASSERT_NOT_NULL(store);
+        int onto_dao =
+            lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "Repo.run", "Dao.fetchRows");
+        int onto_decoy =
+            lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "Repo.run", "Decoy.fetchRows");
+        if (onto_dao < 1 || onto_decoy != 0) {
+            fprintf(stderr, "  [LRP] php/S6g/%s FAIL to_dao=%d to_decoy=%d\n", names[k], onto_dao,
+                    onto_decoy);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        ASSERT_TRUE(onto_dao >= 1);
+        ASSERT_TRUE(onto_decoy == 0);
+    }
+
+    /* Two types assigned to one property — neither may be chosen. */
+    static const LRP_File conflicting[] = {
+        {"Dao.php", "<?php\nclass Dao {\n"
+                    "    public function fetchRows($sql) { return array(); }\n}\n"},
+        {"Other.php", "<?php\nclass Other {\n"
+                      "    public function fetchRows($sql) { return null; }\n}\n"},
+        {"Repo.php", "<?php\nclass Repo {\n"
+                     "    protected $dao;\n"
+                     "    public function __construct($flag) {\n"
+                     "        if ($flag) { $this->dao = new Dao(); }\n"
+                     "        else { $this->dao = new Other(); }\n    }\n"
+                     "    public function run() {\n"
+                     "        return $this->dao->fetchRows('select 1');\n    }\n}\n"}};
+    LRP_Proj lp2;
+    cbm_store_t *store2 = lrp_index(&lp2, conflicting, 3);
+    ASSERT_NOT_NULL(store2);
+    /* The property must stay untyped, so no receiver-typed edge may appear.
+     * A bare-name registry guess still lands on one of the two classes --
+     * that is the pre-existing unknown-receiver behaviour, unchanged here,
+     * and is why the assertion is on the strategy rather than the edge
+     * count. */
+    int typed = lrp_count_calls_with_strategy(store2, lp2.project, "php_method_typed_crossfile");
+    if (typed != 0) {
+        fprintf(stderr, "  [LRP] php/S6g/conflicting FAIL typed_calls=%d expected 0\n", typed);
+        lrp_diag(store2, lp2.project, "conflicting");
+    }
+    lrp_cleanup(&lp2, store2);
+    ASSERT_TRUE(typed == 0);
+    PASS();
+}
+
+/* S6h — a method on a PHP runtime class never reaches a project method sharing
+ * its name. php_lsp carries stubs for the runtime hierarchy, so
+ * `catch (Exception $e) { $e->getMessage(); }` resolves to `Throwable.getMessage`
+ * — a synthetic identity that is by construction not a node in the graph. That
+ * is a definite answer of "not a project symbol", so the bare-name registry
+ * guess must be withheld rather than allowed to pick a decoy.
+ *
+ * A table of builtin FUNCTION names cannot cover this: `getMessage` is a real
+ * method name, and the caller writes it on a receiver. On one monolith the
+ * guess put 2015 edges onto a single unrelated `GetMessagesServiceHandler`.
+ *
+ * `via_catch` and `via_new` are the two ways the receiver gets the runtime
+ * type. `project_class_wins` guards the other direction: a project class of the
+ * same short name that really does declare the method must still resolve, since
+ * suppressing that would lose true edges. */
+TEST(lrp_php_s6h_runtime_class_method_stays_unresolved) {
+    static const LRP_File via_catch[] = {
+        {"Decoy.php", "<?php\nclass Decoy {\n"
+                      "    public function getMessage() { return 'decoy'; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        try { return 1; }\n"
+                       "        catch (Exception $e) { return $e->getMessage(); }\n    }\n}\n"}};
+    static const LRP_File via_new[] = {
+        {"Decoy.php", "<?php\nclass Decoy {\n"
+                      "    public function getMessage() { return 'decoy'; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $e = new RuntimeException('boom');\n"
+                       "        return $e->getMessage();\n    }\n}\n"}};
+    const LRP_File *shapes[2] = {via_catch, via_new};
+    const char *names[2] = {"via_catch", "via_new"};
+
+    for (int k = 0; k < 2; k++) {
+        LRP_Proj lp;
+        cbm_store_t *store = lrp_index(&lp, shapes[k], 2);
+        ASSERT_NOT_NULL(store);
+        int onto_decoy = lrp_exact_calls_by_name(store, lp.project, "run", "getMessage");
+        if (onto_decoy != 0) {
+            fprintf(stderr, "  [LRP] php/S6h/%s FAIL calls_onto_decoy=%d expected 0\n", names[k],
+                    onto_decoy);
+            lrp_diag(store, lp.project, names[k]);
+        }
+        lrp_cleanup(&lp, store);
+        ASSERT_TRUE(onto_decoy == 0);
+    }
+
+    /* A project class really declaring the method keeps its edge. */
+    static const LRP_File project_class_wins[] = {
+        {"Mailer.php", "<?php\nclass Mailer {\n"
+                       "    public function deliver() { return true; }\n}\n"},
+        {"Caller.php", "<?php\nclass Caller {\n"
+                       "    public function run() {\n"
+                       "        $m = new Mailer();\n"
+                       "        return $m->deliver();\n    }\n}\n"}};
+    LRP_Proj lp2;
+    cbm_store_t *store2 = lrp_index(&lp2, project_class_wins, 2);
+    ASSERT_NOT_NULL(store2);
+    int kept = lrp_exact_calls_by_name(store2, lp2.project, "run", "deliver");
+    if (kept < 1) {
+        fprintf(stderr, "  [LRP] php/S6h/project_class_wins FAIL calls=%d expected >=1\n", kept);
+        lrp_diag(store2, lp2.project, "project_class_wins");
+    }
+    lrp_cleanup(&lp2, store2);
+    ASSERT_TRUE(kept >= 1);
+    PASS();
+}
+
 /* S6e — a bare PHP builtin call never reaches a project method sharing its
  * name. PHP forbids redeclaring a builtin, so `count($arr)` is always the
  * builtin; an edge to `Collection::count` is always wrong. `empty($x)` is not
@@ -2210,6 +2372,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_php_s6f_constructed_receiver_inherited_method);
     RUN_TEST(lrp_php_s6d_unindexed_base_method_stays_unresolved);
     RUN_TEST(lrp_php_s6e_builtin_calls_stay_unresolved);
+    RUN_TEST(lrp_php_s6g_property_assigned_new_types_the_chain);
+    RUN_TEST(lrp_php_s6h_runtime_class_method_stays_unresolved);
     RUN_TEST(lrp_php_s7_interface_call);
     RUN_TEST(lrp_php_s8_field_type_hint);
 

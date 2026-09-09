@@ -3843,6 +3843,140 @@ static void process_trait_use(PHPLSPContext *ctx, CBMTypeRegistry *reg, const ch
     }
 }
 
+/* ── property type inferred from `$this->prop = new T()` ──────────────
+ *
+ * PHP gained property type declarations only in 7.4, and a large legacy
+ * monolith shows what that leaves behind: 216121 untyped property
+ * declarations against 1031 typed ones. The declaration says nothing, so
+ * `$this->dao->fetchRows()` has an unknown receiver and the call falls
+ * through to a bare-name guess.
+ *
+ * The assignment does say something. `$this->dao = new Dao();` states the
+ * type outright, and 8057 such assignments appear on that monolith. Only
+ * 1559 of them sit in a constructor -- the rest are lazy initialisers
+ * (`if (!$this->x) { $this->x = new T(); }`) and setup methods -- so the
+ * scan covers the whole class body rather than __construct alone.
+ *
+ * Two assignments of DIFFERENT types to one property make it unusable: a
+ * property that holds either of two classes has no single answer, and
+ * picking one would be the same guess this is meant to replace. Such
+ * properties are dropped.
+ *
+ * Registered after the declaration pass, so add_field's keep-the-first rule
+ * lets an explicit declaration, a promoted parameter or a @var docblock win
+ * over anything inferred here.
+ *
+ * DO NOT land this without the receiver-typed suppression in the pipeline
+ * (cbm_pipeline_php_typed_claim). Typing these properties turns a large
+ * population of calls from "receiver unknown" into "receiver known, target not
+ * in this graph", and every one of those then runs the full registry
+ * fall-through. Measured on the 28k-file monolith: 92s to index with neither
+ * change, 98s with both, and 7556s with this one alone. */
+enum {
+    /* Distinct properties tracked per class. c2's widest class holds far
+     * fewer; a class past this many is not worth a bigger stack frame. */
+    PHP_NEW_FIELD_MAX = 64,
+    /* AST nesting the scan will descend. Bounds work without a heap walk. */
+    PHP_NEW_WALK_DEPTH_MAX = 64,
+};
+
+typedef struct {
+    const char *name;
+    const char *class_qn;
+    bool conflict;
+} php_new_field_t;
+
+typedef struct {
+    php_new_field_t items[PHP_NEW_FIELD_MAX];
+    int count;
+} php_new_fields_t;
+
+static void note_new_assigned_field(php_new_fields_t *acc, const char *name, const char *class_qn) {
+    for (int i = 0; i < acc->count; i++) {
+        if (strcmp(acc->items[i].name, name) != 0)
+            continue;
+        if (strcmp(acc->items[i].class_qn, class_qn) != 0)
+            acc->items[i].conflict = true;
+        return;
+    }
+    if (acc->count >= PHP_NEW_FIELD_MAX)
+        return;
+    acc->items[acc->count].name = name;
+    acc->items[acc->count].class_qn = class_qn;
+    acc->items[acc->count].conflict = false;
+    acc->count++;
+}
+
+/* True for a node that opens a body where `$this` is a DIFFERENT object, so
+ * `$this->x = new T()` inside it says nothing about the class being scanned.
+ *
+ * `new class { ... }` needs no entry of its own: the grammar spells it as an
+ * object_creation_expression, which is listed. Listing it also stops the
+ * descent into a `new T(...)` argument list, where an assignment to our own
+ * `$this` would be pathological enough to ignore.
+ *
+ * Closures and arrow functions are deliberately absent: PHP binds the
+ * enclosing `$this` into both, so an assignment there is still ours. */
+static bool php_rebinds_this(const char *kind) {
+    return strcmp(kind, "class_declaration") == 0 || strcmp(kind, "trait_declaration") == 0 ||
+           strcmp(kind, "interface_declaration") == 0 ||
+           strcmp(kind, "enum_declaration") == 0 || strcmp(kind, "anonymous_class") == 0 ||
+           strcmp(kind, "object_creation_expression") == 0;
+}
+
+static void scan_new_assigned_fields(PHPLSPContext *ctx, TSNode n, php_new_fields_t *acc,
+                                     int depth) {
+    if (ts_node_is_null(n) || depth > PHP_NEW_WALK_DEPTH_MAX)
+        return;
+    const char *kind = ts_node_type(n);
+    if (depth > 0 && php_rebinds_this(kind))
+        return;
+
+    if (strcmp(kind, "assignment_expression") == 0) {
+        TSNode lhs = ts_node_child_by_field_name(n, "left", 4);
+        TSNode rhs = ts_node_child_by_field_name(n, "right", 5);
+        if (!ts_node_is_null(lhs) && !ts_node_is_null(rhs) &&
+            strcmp(ts_node_type(lhs), "member_access_expression") == 0 &&
+            strcmp(ts_node_type(rhs), "object_creation_expression") == 0) {
+            TSNode obj = ts_node_child_by_field_name(lhs, "object", 6);
+            TSNode fname = ts_node_child_by_field_name(lhs, "name", 4);
+            if (!ts_node_is_null(obj) && !ts_node_is_null(fname)) {
+                char *ot = php_node_text(ctx, obj);
+                char *fn = php_node_text(ctx, fname);
+                if (ot && fn && ot[0] == '$' && strcmp(ot + 1, "this") == 0) {
+                    const CBMType *t = eval_object_creation_type(ctx, rhs);
+                    if (t && t->kind == CBM_TYPE_NAMED && t->data.named.qualified_name) {
+                        note_new_assigned_field(acc, fn, t->data.named.qualified_name);
+                    }
+                }
+            }
+        }
+    }
+
+    uint32_t nc = ts_node_child_count(n);
+    for (uint32_t i = 0; i < nc; i++) {
+        scan_new_assigned_fields(ctx, ts_node_child(n, i), acc, depth + 1);
+    }
+}
+
+static void extract_new_assigned_fields(PHPLSPContext *ctx, TSNode class_body, const char *cqn,
+                                        php_class_fields_t *out) {
+    php_new_fields_t acc;
+    acc.count = 0;
+    /* `new self()` / `new static()` need the class in scope; the class-body
+     * loop leaves enclosing_class_qn unset, so supply it for the scan. */
+    const char *saved = ctx->enclosing_class_qn;
+    ctx->enclosing_class_qn = cqn;
+    scan_new_assigned_fields(ctx, class_body, &acc, 0);
+    ctx->enclosing_class_qn = saved;
+    for (int i = 0; i < acc.count; i++) {
+        if (acc.items[i].conflict)
+            continue;
+        add_field(out, ctx->arena, acc.items[i].name,
+                  cbm_type_named(ctx->arena, acc.items[i].class_qn));
+    }
+}
+
 static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode class_node,
                                      php_class_field_table_t *tab) {
     const char *cqn = class_qn_for_node(ctx, class_node);
@@ -4126,6 +4260,10 @@ static void process_class_for_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, T
             }
         }
     }
+
+    /* Last, so add_field's keep-the-first rule gives every declared,
+     * promoted and @var-documented type priority over inference. */
+    extract_new_assigned_fields(ctx, body, cqn, f);
 }
 
 static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root,

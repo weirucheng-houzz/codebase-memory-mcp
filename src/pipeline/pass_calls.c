@@ -511,18 +511,20 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    /* PHP receiver typed in another file: the blocker row sits under the
-     * confidence floor, so `lsp` above is NULL for exactly these calls. Look it
-     * up explicitly and let the class name supply the module prefix the
-     * exact-QN lookup lacks. Placed before the registry fall-through below so a
-     * proven class beats a bare short-name guess. Mirrored in pass_parallel.c. */
+    /* PHP receiver whose class php_lsp proved: let the class name supply the
+     * module prefix the exact-QN lookup lacks. Placed before the registry
+     * fall-through below so a proven class beats a bare short-name guess.
+     * Two kinds of claim land here — the below-floor blocker row the matcher
+     * above cannot see, and an above-floor php_method_typed row whose
+     * callee_qn names no node (a PHP runtime stub such as
+     * `Throwable.getMessage`). Both mean the receiver's class is known.
+     * Mirrored in pass_parallel.c. */
     bool php_receiver_absent = false;
-    const CBMResolvedCall *php_blocked =
-        cbm_pipeline_find_php_typed_unindexed(lsp_calls, call, lang);
-    if (php_blocked) {
+    CBMPhpTypedClaim php_claim = cbm_pipeline_php_typed_claim(lsp_calls, call, lang, lsp);
+    if (php_claim.callee_qn) {
         bool php_via_base = false;
         const cbm_gbuf_node_t *php_typed = cbm_pipeline_php_receiver_typed_target(
-            ctx->gbuf, lang, php_blocked->strategy, php_blocked->callee_qn, &php_via_base);
+            ctx->gbuf, lang, php_claim.strategy, php_claim.callee_qn, &php_via_base);
         if (php_typed && source_node->id != php_typed->id) {
             cbm_resolution_t res = {0};
             res.qualified_name = php_typed->qualified_name;
@@ -534,16 +536,18 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
         }
-        /* Nothing found, and that is the marker doing the job it was written
-         * for: the receiver's class IS known and the method is declared nowhere
-         * on it. The usual cause is a base class outside the indexed tree —
+        /* Nothing found, and that is the claim doing the job it was kept for:
+         * the receiver's class IS known and the method is declared nowhere on
+         * it in this graph. Either a base class sits outside the indexed tree —
          * `$this->assertEquals(...)` in a class extending PHPUnit's TestCase,
-         * with vendor/ excluded. Guessing by bare name then binds every such
-         * call to whichever project class happens to declare an `assertEquals`;
-         * on one monolith that was 6207 edges onto a single unrelated test
-         * batch class. Withhold the registry fall-through instead. Service and
-         * route classification below still runs, so only the plain CALLS guess
-         * is given up. Mirrored in pass_parallel.c. */
+         * with vendor/ excluded — or the class is a PHP runtime one the graph
+         * deliberately does not hold. Guessing by bare name then binds every
+         * such call to whichever project class happens to declare the name; on
+         * one monolith that was 6207 edges onto a single unrelated test batch
+         * class and 2015 onto an unrelated `getMessage`. Withhold the registry
+         * fall-through instead. Service and route classification below still
+         * runs, so only the plain CALLS guess is given up. Mirrored in
+         * pass_parallel.c. */
         php_receiver_absent = !php_typed;
     }
 

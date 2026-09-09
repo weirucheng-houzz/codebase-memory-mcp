@@ -956,6 +956,34 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
  * whose declaring file the per-file def filter never selected. */
 #define CBM_PHP_TYPED_UNINDEXED_STRATEGY "php_method_typed_unindexed"
 
+/* Strategies php_lsp emits once it has PROVEN the receiver's class: the method
+ * was found declared on that class (php_method_typed) or on one of its
+ * ancestors (php_method_inherited), both at 0.95. Unlike the marker above,
+ * these sit over CBM_LSP_CONFIDENCE_FLOOR, so the generic matcher does hand
+ * them to the bridge — but their callee_qn need not name a graph node.
+ * php_lsp carries stubs for the PHP runtime hierarchy, so
+ * `catch (Exception $e) { $e->getMessage(); }` resolves to
+ * `Throwable.getMessage`: a synthetic identity that is by construction not in
+ * the graph. PHP does not take the Class.method tail fallback
+ * (cbm_pipeline_lsp_allow_tail_match covers the JVM only), so such a call
+ * arrives here with no target and used to be handed to the bare-name registry
+ * guess — which put 2015 edges onto one unrelated `getMessage` on a real
+ * monolith. All three strategies mean the same thing for that decision: the
+ * receiver's class is known, so the callee_qn is an answer rather than a
+ * guess, and the answer must be tried against the graph by class name and
+ * then trusted when it finds nothing. */
+#define CBM_PHP_METHOD_TYPED_STRATEGY "php_method_typed"
+#define CBM_PHP_METHOD_INHERITED_STRATEGY "php_method_inherited"
+
+static inline bool cbm_php_receiver_typed_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    return strcmp(strategy, CBM_PHP_TYPED_UNINDEXED_STRATEGY) == 0 ||
+           strcmp(strategy, CBM_PHP_METHOD_TYPED_STRATEGY) == 0 ||
+           strcmp(strategy, CBM_PHP_METHOD_INHERITED_STRATEGY) == 0;
+}
+
 /* Strategy for one recovered here: the class node supplied the module prefix
  * and the member QN was an exact graph hit. */
 #define CBM_PHP_TYPED_CROSSFILE_STRATEGY "php_method_typed_crossfile"
@@ -1009,6 +1037,37 @@ static inline const CBMResolvedCall *cbm_pipeline_find_php_typed_unindexed(
         found = rc;
     }
     return found;
+}
+
+/* The one PHP receiver-typed claim covering this call, from either source.
+ *
+ * An above-floor row reached the bridge through the generic matcher and is
+ * already tied to this occurrence, so it is taken as given. Only when there is
+ * none does the below-floor marker get its own lookup. Both lanes read this so
+ * they cannot drift apart. */
+typedef struct {
+    const char *strategy;
+    const char *callee_qn;
+} CBMPhpTypedClaim;
+
+static inline CBMPhpTypedClaim cbm_pipeline_php_typed_claim(const CBMResolvedCallArray *arr,
+                                                            const CBMCall *call, CBMLanguage lang,
+                                                            const CBMResolvedCall *lsp) {
+    CBMPhpTypedClaim claim = {NULL, NULL};
+    if (lang != CBM_LANG_PHP) {
+        return claim;
+    }
+    if (lsp && lsp->callee_qn && cbm_php_receiver_typed_strategy(lsp->strategy)) {
+        claim.strategy = lsp->strategy;
+        claim.callee_qn = lsp->callee_qn;
+        return claim;
+    }
+    const CBMResolvedCall *blocked = cbm_pipeline_find_php_typed_unindexed(arr, call, lang);
+    if (blocked) {
+        claim.strategy = blocked->strategy;
+        claim.callee_qn = blocked->callee_qn;
+    }
+    return claim;
 }
 
 /* Strategy for one reached through the receiver class's own base chain. */
@@ -1158,7 +1217,7 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_php_receiver_typed_target(
     if (lang != CBM_LANG_PHP || !gbuf || !strategy || !callee_qn) {
         return NULL;
     }
-    if (strcmp(strategy, CBM_PHP_TYPED_UNINDEXED_STRATEGY) != 0) {
+    if (!cbm_php_receiver_typed_strategy(strategy)) {
         return NULL;
     }
     /* resolve_member_call builds `<class_qn>.<method>`, and class_qn already
